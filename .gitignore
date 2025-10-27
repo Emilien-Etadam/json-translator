@@ -27,6 +27,7 @@ config.local.*
 
 # Application-generated files
 translated_output.json
+translated_output_autosave_*.json
 translation_log_*.txt
 *.log
 

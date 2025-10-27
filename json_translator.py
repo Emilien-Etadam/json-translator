@@ -6,7 +6,6 @@ Translates specific JSON keys using local Ollama models
 
 import json
 import re
-import hashlib
 import logging
 import threading
 from pathlib import Path
@@ -32,9 +31,10 @@ class TranslationCache:
         self.stats = {"hits": 0, "misses": 0, "evictions": 0}
 
     def _make_key(self, text: str, target_lang: str, model: str, options: str = "") -> str:
-        """Generate cache key from text, language, model and optional flags"""
+        """Generate cache key using fast hash function"""
         content = f"{text}|{target_lang}|{model}|{options}"
-        return hashlib.md5(content.encode()).hexdigest()
+        # Use Python's built-in hash (much faster than MD5)
+        return str(hash(content))
 
     def get(self, text: str, target_lang: str, model: str, options: str = "") -> Optional[str]:
         """Retrieve cached translation and mark as recently used"""
@@ -492,9 +492,8 @@ class OllamaTranslator:
                                 progress_callback=None, dry_run=False,
                                 preserve_tags: bool = False) -> Tuple[Dict, List[str]]:
         """Translate only specified keys in JSON"""
-        # Create deep copy
-        import copy
-        translated_data = copy.deepcopy(data)
+        # Use JSON serialization for faster copy (vs deepcopy)
+        translated_data = json.loads(json.dumps(data))
 
         # Select keys
         selected_keys = JSONKeySelector.select_keys(data, keys_to_translate)
@@ -713,9 +712,11 @@ def create_gradio_interface():
 
         def perform_translation(source_data, keys_text, target_lang, model, dry_run, translate_all, progress=gr.Progress()):
             """Perform the translation with live updates and stop support"""
+            from collections import deque
             translation_stop_event.clear()
             selected_keys_text = ""
-            live_log: List[str] = []
+            # Use deque with maxlen for efficient log management
+            live_log = deque(maxlen=50)
 
             if not source_data:
                 yield None, "", "❌ No source JSON loaded", gr.update(visible=False), gr.update(value="")
@@ -773,8 +774,8 @@ def create_gradio_interface():
                     yield preview_data, selected_keys_text, status, gr.update(visible=False), gr.update(value="")
                     return
 
-                import copy
-                translated_data = copy.deepcopy(source_data)
+                # Use JSON serialization for faster copy (vs deepcopy)
+                translated_data = json.loads(json.dumps(source_data))
                 flat_data = JSONKeySelector.flatten_json(source_data)
                 items = [
                     (key, flat_data.get(key))
@@ -788,33 +789,70 @@ def create_gradio_interface():
                     return
 
                 progress(0, desc="Starting translation...")
-                status = f"🚀 Starting translation ({total} keys)..."
+                status = f"🚀 Starting translation ({total} keys) with parallel processing..."
                 yield translated_data, selected_keys_text, status, gr.update(visible=False), gr.update(value="")
 
-                for idx, (key, value) in enumerate(items, start=1):
-                    if translation_stop_event.is_set():
-                        status = f"⏹️ Translation stopped after {idx - 1}/{total} keys."
-                        yield translated_data, selected_keys_text, status, gr.update(visible=False), gr.update(value='\n'.join(live_log[-50:]))
-                        return
+                # Parallel translation with ThreadPoolExecutor
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                import time
 
-                    progress(idx / total, desc=f"Translating {idx}/{total}: {key}")
-                    translated_value = translator.translate_text(
-                        value,
-                        target_lang_name,
-                        model,
-                        preserve_tags=translate_all
-                    )
+                completed_count = 0
+                MAX_WORKERS = 4  # Parallel translation workers
+                AUTOSAVE_INTERVAL = 10  # Auto-save every 10 translations
 
-                    JSONKeySelector.set_nested_value(translated_data, key, translated_value)
-                    live_log.append(f"{key}: {translated_value}")
-                    live_output = '\\n'.join(live_log[-50:])
-                    status = f"🔄 Translating key {idx}/{total}: {key}"
-                    yield translated_data, selected_keys_text, status, gr.update(visible=False), gr.update(value=live_output)
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    # Submit all translation tasks
+                    future_to_item = {
+                        executor.submit(
+                            translator.translate_text,
+                            value,
+                            target_lang_name,
+                            model,
+                            preserve_tags=translate_all
+                        ): (key, value)
+                        for key, value in items
+                    }
 
-                    if translation_stop_event.is_set():
-                        status = f"⏹️ Translation stopped after {idx}/{total} keys."
-                        yield translated_data, selected_keys_text, status, gr.update(visible=False), gr.update(value='\n'.join(live_log[-50:]))
-                        return
+                    # Process completed translations as they finish
+                    for future in as_completed(future_to_item):
+                        if translation_stop_event.is_set():
+                            # Cancel pending futures
+                            for f in future_to_item:
+                                f.cancel()
+                            status = f"⏹️ Translation stopped after {completed_count}/{total} keys."
+                            yield translated_data, selected_keys_text, status, gr.update(visible=False), gr.update(value='\n'.join(live_log))
+                            return
+
+                        key, original_value = future_to_item[future]
+
+                        try:
+                            translated_value = future.result()
+                            JSONKeySelector.set_nested_value(translated_data, key, translated_value)
+
+                            completed_count += 1
+                            live_log.append(f"{key}: {translated_value}")
+
+                            # Update progress
+                            progress(completed_count / total, desc=f"Translating {completed_count}/{total}: {key}")
+                            live_output = '\\n'.join(live_log)
+                            status = f"🔄 Translated {completed_count}/{total} keys ({MAX_WORKERS} parallel workers)"
+                            yield translated_data, selected_keys_text, status, gr.update(visible=False), gr.update(value=live_output)
+
+                            # Auto-save every AUTOSAVE_INTERVAL translations
+                            if completed_count % AUTOSAVE_INTERVAL == 0:
+                                autosave_path = Path(f"translated_output_autosave_{completed_count}.json")
+                                try:
+                                    with open(autosave_path, 'w', encoding='utf-8') as f:
+                                        json.dump(translated_data, f, ensure_ascii=False, indent=2)
+                                    logger.info(f"Auto-saved progress at {completed_count}/{total} translations")
+                                except Exception as save_err:
+                                    logger.warning(f"Auto-save failed: {save_err}")
+
+                        except Exception as e:
+                            logger.error(f"Translation failed for key '{key}': {e}")
+                            # Continue with other translations even if one fails
+                            live_log.append(f"{key}: ❌ Failed - {str(e)[:50]}")
+                            completed_count += 1
 
                 progress(1, desc="Translation complete.")
                 status = f"✅ Translation complete! Translated {len(translator.translation_log)} strings across {len(selected_keys)} keys.\n"
@@ -826,7 +864,7 @@ def create_gradio_interface():
                 with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(translated_data, f, ensure_ascii=False, indent=2)
 
-                final_live = '\n'.join(live_log[-50:])
+                final_live = '\n'.join(live_log)
                 if final_live:
                     final_live += "\n✅ Translation complete."
                 else:
@@ -842,7 +880,7 @@ def create_gradio_interface():
 
             except Exception as e:
                 logger.exception("Translation failed")
-                live_output = '\n'.join(live_log[-50:])
+                live_output = '\n'.join(live_log)
 
                 # Provide contextual error messages
                 error_str = str(e).lower()
