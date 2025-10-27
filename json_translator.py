@@ -23,11 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 class TranslationCache:
-    """In-memory cache for translations to avoid redundant API calls"""
+    """In-memory cache for translations to avoid redundant API calls with LRU eviction"""
 
-    def __init__(self):
-        self.cache: Dict[str, str] = {}
-        self.stats = {"hits": 0, "misses": 0}
+    def __init__(self, max_size: int = 1000):
+        from collections import OrderedDict
+        self.cache: OrderedDict = OrderedDict()
+        self.max_size = max_size
+        self.stats = {"hits": 0, "misses": 0, "evictions": 0}
 
     def _make_key(self, text: str, target_lang: str, model: str, options: str = "") -> str:
         """Generate cache key from text, language, model and optional flags"""
@@ -35,23 +37,34 @@ class TranslationCache:
         return hashlib.md5(content.encode()).hexdigest()
 
     def get(self, text: str, target_lang: str, model: str, options: str = "") -> Optional[str]:
-        """Retrieve cached translation"""
+        """Retrieve cached translation and mark as recently used"""
         key = self._make_key(text, target_lang, model, options)
         if key in self.cache:
             self.stats["hits"] += 1
+            # Move to end to mark as recently used (LRU)
+            self.cache.move_to_end(key)
             return self.cache[key]
         self.stats["misses"] += 1
         return None
 
     def set(self, text: str, target_lang: str, model: str, translation: str, options: str = ""):
-        """Store translation in cache"""
+        """Store translation in cache with LRU eviction if needed"""
         key = self._make_key(text, target_lang, model, options)
+
+        # Evict oldest entry if cache is full
+        if len(self.cache) >= self.max_size and key not in self.cache:
+            self.cache.popitem(last=False)  # Remove oldest (FIFO)
+            self.stats["evictions"] += 1
+            logger.debug(f"Cache full, evicted oldest entry. Total evictions: {self.stats['evictions']}")
+
         self.cache[key] = translation
+        # Move to end to mark as most recently used
+        self.cache.move_to_end(key)
 
     def clear(self):
         """Clear cache"""
         self.cache.clear()
-        self.stats = {"hits": 0, "misses": 0}
+        self.stats = {"hits": 0, "misses": 0, "evictions": 0}
 
 
 class VariablePreserver:
@@ -244,38 +257,80 @@ class JSONKeySelector:
 
     @staticmethod
     def set_nested_value(data: Any, path: str, value: Any):
-        """Set value in nested dict/list using dot notation path"""
+        """Set value in nested dict/list using dot notation path with error handling"""
         keys = re.split(r'\.|\[|\]', path)
         keys = [k for k in keys if k]
 
-        current_level = data
-        for key in keys[:-1]:
-            if isinstance(current_level, list):
-                current_level = current_level[int(key)]
-            else:
-                current_level = current_level[key]
+        if not keys:
+            raise ValueError(f"Invalid path: '{path}' - no keys found")
 
-        # Set final value
-        final_key = keys[-1]
-        if isinstance(current_level, list):
-            current_level[int(final_key)] = value
-        else:
-            current_level[final_key] = value
+        current_level = data
+        try:
+            # Navigate to parent container
+            for i, key in enumerate(keys[:-1]):
+                if isinstance(current_level, list):
+                    idx = int(key)
+                    if idx >= len(current_level) or idx < -len(current_level):
+                        raise IndexError(f"Index {idx} out of range for list at path segment {i+1} in '{path}'")
+                    current_level = current_level[idx]
+                elif isinstance(current_level, dict):
+                    if key not in current_level:
+                        raise KeyError(f"Key '{key}' not found at path segment {i+1} in '{path}'")
+                    current_level = current_level[key]
+                else:
+                    raise TypeError(f"Cannot navigate into {type(current_level).__name__} at path segment {i+1} in '{path}'")
+
+            # Set final value
+            final_key = keys[-1]
+            if isinstance(current_level, list):
+                idx = int(final_key)
+                if idx >= len(current_level) or idx < -len(current_level):
+                    raise IndexError(f"Index {idx} out of range for final list in '{path}'")
+                current_level[idx] = value
+            elif isinstance(current_level, dict):
+                current_level[final_key] = value
+            else:
+                raise TypeError(f"Cannot set value in {type(current_level).__name__} at final position in '{path}'")
+
+        except ValueError as e:
+            logger.error(f"Invalid path value in '{path}': {e}")
+            raise ValueError(f"Invalid path '{path}': {e}") from e
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Path navigation failed for '{path}': {e}")
+            raise
 
     @staticmethod
     def get_nested_value(data: Dict, path: str) -> Any:
-        """Get value from nested dict using dot notation path"""
+        """Get value from nested dict/list using dot notation path with error handling"""
         keys = re.split(r'\.|\[|\]', path)
         keys = [k for k in keys if k]
 
-        current = data
-        for key in keys:
-            if isinstance(current, dict):
-                current = current[key]
-            elif isinstance(current, list):
-                current = current[int(key)]
+        if not keys:
+            raise ValueError(f"Invalid path: '{path}' - no keys found")
 
-        return current
+        current = data
+        try:
+            for i, key in enumerate(keys):
+                if isinstance(current, dict):
+                    if key not in current:
+                        raise KeyError(f"Key '{key}' not found at path segment {i+1} in '{path}'")
+                    current = current[key]
+                elif isinstance(current, list):
+                    idx = int(key)
+                    if idx >= len(current) or idx < -len(current):
+                        raise IndexError(f"Index {idx} out of range for list at path segment {i+1} in '{path}'")
+                    current = current[idx]
+                else:
+                    raise TypeError(f"Cannot navigate into {type(current).__name__} at path segment {i+1} in '{path}'")
+
+            return current
+
+        except ValueError as e:
+            logger.error(f"Invalid path value in '{path}': {e}")
+            raise ValueError(f"Invalid path '{path}': {e}") from e
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Path navigation failed for '{path}': {e}")
+            raise
 
 
 class OllamaTranslator:
@@ -361,14 +416,26 @@ class OllamaTranslator:
         )
 
         try:
-            # Call Ollama
+            # Call Ollama with timeout protection
             if progress_callback:
                 progress_callback(f"Translating: {text[:50]}...")
 
-            response = ollama.chat(
-                model=model,
-                messages=[{'role': 'user', 'content': prompt}]
-            )
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+            def _call_ollama():
+                return ollama.chat(
+                    model=model,
+                    messages=[{'role': 'user', 'content': prompt}]
+                )
+
+            # Execute with 30 second timeout
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_call_ollama)
+                try:
+                    response = future.result(timeout=30)
+                except FutureTimeoutError:
+                    logger.error(f"Translation timed out after 30s for text: {text[:100]}...")
+                    return text  # Return original text on timeout
 
             translation = response['message']['content'].strip()
 
@@ -602,9 +669,25 @@ def create_gradio_interface():
 
         # Event handlers
         def load_json_file(file_path):
-            """Load and display JSON file"""
+            """Load and display JSON file with size validation"""
             if not file_path:
                 return None, None, "⚠️ No file uploaded", gr.update(choices=[])
+
+            # Validate file size (max 50MB)
+            MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+            try:
+                import os
+                file_size = os.path.getsize(file_path)
+                if file_size > MAX_FILE_SIZE:
+                    size_mb = file_size / (1024 * 1024)
+                    return (
+                        None, None,
+                        f"❌ File too large ({size_mb:.1f}MB). Maximum allowed size: 50MB",
+                        gr.update(choices=[])
+                    )
+                logger.info(f"Loading JSON file: {file_path} ({file_size / 1024:.1f}KB)")
+            except OSError as e:
+                return None, None, f"❌ Cannot access file: {e}", gr.update(choices=[])
 
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -760,7 +843,57 @@ def create_gradio_interface():
             except Exception as e:
                 logger.exception("Translation failed")
                 live_output = '\n'.join(live_log[-50:])
-                yield None, selected_keys_text, f"\u274c Translation failed: {str(e)}", gr.update(visible=False), gr.update(value=live_output)
+
+                # Provide contextual error messages
+                error_str = str(e).lower()
+                if "connection" in error_str or "connect" in error_str:
+                    error_msg = (
+                        f"❌ Cannot connect to Ollama: {str(e)}\n\n"
+                        f"💡 Solutions:\n"
+                        f"  • Check if Ollama is running: ollama serve\n"
+                        f"  • Verify Ollama is installed: https://ollama.ai"
+                    )
+                elif "model" in error_str and ("not found" in error_str or "404" in error_str):
+                    error_msg = (
+                        f"❌ Model '{model}' not found: {str(e)}\n\n"
+                        f"💡 Solution:\n"
+                        f"  • Install the model: ollama pull {model}\n"
+                        f"  • Check available models: ollama list"
+                    )
+                elif "timeout" in error_str or "timed out" in error_str:
+                    error_msg = (
+                        f"❌ Translation timed out: {str(e)}\n\n"
+                        f"💡 Possible causes:\n"
+                        f"  • Text is too long or complex\n"
+                        f"  • Model is slow (try a smaller/faster model)\n"
+                        f"  • Ollama server is overloaded"
+                    )
+                elif "memory" in error_str or "out of memory" in error_str:
+                    error_msg = (
+                        f"❌ Out of memory: {str(e)}\n\n"
+                        f"💡 Solutions:\n"
+                        f"  • Use a smaller model (e.g., mistral:7b)\n"
+                        f"  • Process fewer keys at once\n"
+                        f"  • Close other applications"
+                    )
+                elif isinstance(e, (KeyError, IndexError, ValueError)) and "path" in error_str:
+                    error_msg = (
+                        f"❌ Invalid JSON path: {str(e)}\n\n"
+                        f"💡 Check your key patterns:\n"
+                        f"  • Ensure paths exist in JSON\n"
+                        f"  • Verify array indices are valid\n"
+                        f"  • Use dry-run mode to preview"
+                    )
+                else:
+                    error_msg = (
+                        f"❌ Translation failed: {str(e)}\n\n"
+                        f"💡 Check logs for details or try:\n"
+                        f"  • Verifying your JSON is valid\n"
+                        f"  • Using dry-run mode first\n"
+                        f"  • Checking Ollama is running"
+                    )
+
+                yield None, selected_keys_text, error_msg, gr.update(visible=False), gr.update(value=live_output)
 
             finally:
                 translation_stop_event.clear()
