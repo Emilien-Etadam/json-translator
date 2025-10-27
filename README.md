@@ -44,7 +44,7 @@ ollama pull mixtral
 ### Installation du script
 ```bash
 # Clonez ou téléchargez les fichiers
-cd "Markdown Translate"
+cd "json_translator"
 
 # Installez les dépendances Python
 pip install -r requirements.txt
