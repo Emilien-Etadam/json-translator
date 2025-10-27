@@ -151,6 +151,92 @@ class CaseStyleHelper:
         return indices
 
 
+class TranslationQualityValidator:
+    """Validates translation quality and detects common issues"""
+
+    @staticmethod
+    def validate(source: str, target: str, source_lang: str, target_lang: str) -> List[str]:
+        """
+        Validate translation quality and return list of issues found.
+
+        Returns:
+            List of issue descriptions (empty list if no issues)
+        """
+        issues = []
+
+        # Skip validation for empty strings
+        if not source or not target:
+            return issues
+
+        # 1. Check length ratio (translations shouldn't be dramatically different)
+        source_len = len(source.strip())
+        target_len = len(target.strip())
+
+        if source_len > 0:
+            ratio = target_len / source_len
+            if ratio > 3.0:
+                issues.append(f"Translation is {ratio:.1f}x longer than source (may indicate verbosity or errors)")
+            elif ratio < 0.3:
+                issues.append(f"Translation is {1/ratio:.1f}x shorter than source (may be incomplete)")
+
+        # 2. Check if variables are preserved
+        var_pattern = re.compile(r'\{\{[^}]+\}\}|\{[^}]+\}|%\([^)]+\)[sd]|%[sd]|\$\{[^}]+\}|\[\[.*?\]\]')
+        source_vars = set(var_pattern.findall(source))
+        target_vars = set(var_pattern.findall(target))
+
+        if source_vars != target_vars:
+            missing = source_vars - target_vars
+            extra = target_vars - source_vars
+            if missing:
+                issues.append(f"Missing variables in translation: {', '.join(missing)}")
+            if extra:
+                issues.append(f"Extra variables in translation: {', '.join(extra)}")
+
+        # 3. Check if text appears untranslated (when it should be different)
+        if source == target and source_len > 5:
+            # Check if languages are different
+            if source_lang.lower() != target_lang.lower():
+                # Allow some English/French words that are identical
+                common_words = {'restaurant', 'menu', 'hotel', 'cafe', 'tour', 'bus', 'taxi'}
+                if source.lower() not in common_words:
+                    issues.append("Text appears untranslated (identical to source)")
+
+        # 4. Check line count preservation (for multi-line text)
+        source_lines = source.count('\n')
+        target_lines = target.count('\n')
+        if source_lines > 2 and abs(source_lines - target_lines) > 2:
+            issues.append(f"Line count differs significantly (source: {source_lines+1}, target: {target_lines+1})")
+
+        # 5. Check for placeholder corruption
+        if '__VAR_' in target:
+            issues.append("Translation contains unreplaced placeholders (__VAR_)")
+
+        # 6. Check for repeated text (indication of model issues)
+        if target_len > 50:
+            words = target.split()
+            if len(words) > 10:
+                # Check for repeated sequences
+                for i in range(len(words) - 5):
+                    sequence = ' '.join(words[i:i+3])
+                    rest = ' '.join(words[i+3:])
+                    if sequence in rest:
+                        issues.append("Translation contains repeated sequences (may indicate model error)")
+                        break
+
+        return issues
+
+    @staticmethod
+    def format_issues(issues: List[str]) -> str:
+        """Format issues for display"""
+        if not issues:
+            return "✅ No issues detected"
+
+        formatted = "⚠️ Quality issues detected:\n"
+        for issue in issues:
+            formatted += f"  • {issue}\n"
+        return formatted
+
+
 class JSONKeySelector:
     """Selects JSON keys based on path patterns and regex"""
 
@@ -354,7 +440,9 @@ class OllamaTranslator:
     def __init__(self):
         self.cache = TranslationCache()
         self.variable_preserver = VariablePreserver()
+        self.quality_validator = TranslationQualityValidator()
         self.translation_log = []
+        self.quality_issues = []  # Track quality issues
 
     @staticmethod
     def get_available_models() -> List[str]:
@@ -451,14 +539,52 @@ class OllamaTranslator:
                             translated_lines[idx] = CaseStyleHelper.apply_case(translated_lines[idx], "upper")
                     translation = "\n".join(translated_lines)
 
+            # Validate translation quality
+            quality_issues = self.quality_validator.validate(
+                source=text,
+                target=translation,
+                source_lang='english',  # Assume English source for now
+                target_lang=target_lang
+            )
+
+            # Log quality issues if found
+            if quality_issues:
+                self.quality_issues.append({
+                    'source': text[:100],
+                    'target': translation[:100],
+                    'issues': quality_issues,
+                    'timestamp': datetime.now().isoformat()
+                })
+                # Structured logging
+                logger.warning(json.dumps({
+                    'event': 'translation_quality_issue',
+                    'source_preview': text[:50],
+                    'target_preview': translation[:50],
+                    'issues': quality_issues,
+                    'target_lang': target_lang
+                }))
+
             # Cache result
             self.cache.set(text, target_lang, model, translation, options=cache_options)
+
+            # Structured logging for successful translation
+            logger.info(json.dumps({
+                'event': 'translation_completed',
+                'source_length': len(text),
+                'target_length': len(translation),
+                'target_lang': target_lang,
+                'model': model,
+                'cached': False,
+                'quality_issues': len(quality_issues),
+                'timestamp': datetime.now().isoformat()
+            }))
 
             # Log translation
             self.translation_log.append({
                 'source': text,
                 'target': translation,
                 'language': target_lang,
+                'quality_issues': quality_issues,
                 'timestamp': datetime.now().isoformat()
             })
 
@@ -1036,8 +1162,136 @@ def create_gradio_interface():
     return app
 
 
+def cli_main():
+    """CLI entry point for batch processing"""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="JSON Selective Translator - Translate specific JSON keys using Ollama",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Translate specific keys
+  python json_translator.py input.json --keys "title" "description" --lang français -o output.json
+
+  # Translate all string values
+  python json_translator.py input.json --all --lang english -o output.json
+
+  # Use wildcard patterns
+  python json_translator.py input.json --keys "*.title" "items[*].content" --lang español
+
+  # Specify model
+  python json_translator.py input.json --keys "title" --lang français --model mistral -o output.json
+        """
+    )
+
+    parser.add_argument('input', help='Input JSON file path')
+    parser.add_argument('--keys', '-k', nargs='+', help='JSON keys to translate (supports wildcards)')
+    parser.add_argument('--all', '-a', action='store_true', help='Translate all string values')
+    parser.add_argument('--lang', '-l', required=True, help='Target language (e.g., français, english, español)')
+    parser.add_argument('--model', '-m', default='llama2', help='Ollama model to use (default: llama2)')
+    parser.add_argument('--output', '-o', help='Output file path (default: translated_output.json)')
+    parser.add_argument('--validate', '-v', action='store_true', help='Show quality validation results')
+    parser.add_argument('--quiet', '-q', action='store_true', help='Suppress progress messages')
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if not args.all and not args.keys:
+        parser.error("Either --keys or --all must be specified")
+
+    # Load input JSON
+    try:
+        with open(args.input, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not args.quiet:
+            print(f"✅ Loaded JSON from {args.input}")
+    except FileNotFoundError:
+        print(f"❌ Error: File not found: {args.input}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"❌ Error: Invalid JSON in {args.input}: {e}")
+        sys.exit(1)
+
+    # Check Ollama connection
+    try:
+        models = OllamaTranslator.get_available_models()
+        if not models:
+            print("❌ Error: No Ollama models found")
+            print("Install Ollama from https://ollama.ai and run: ollama pull llama2")
+            sys.exit(1)
+        if args.model not in models:
+            print(f"⚠️  Warning: Model '{args.model}' not found. Available models: {', '.join(models)}")
+            response = input("Continue anyway? (y/N): ")
+            if response.lower() != 'y':
+                sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error: Cannot connect to Ollama: {e}")
+        print("Make sure Ollama is running")
+        sys.exit(1)
+
+    # Prepare keys
+    if args.all:
+        flat_data = JSONKeySelector.flatten_json(data)
+        keys_list = [key for key, value in flat_data.items() if isinstance(value, str)]
+        if not args.quiet:
+            print(f"📋 Translating all {len(keys_list)} string values")
+    else:
+        keys_list = args.keys
+        if not args.quiet:
+            print(f"📋 Translating keys: {', '.join(keys_list)}")
+
+    # Translate
+    translator_instance = OllamaTranslator()
+    if not args.quiet:
+        print(f"🚀 Starting translation to {args.lang} using model {args.model}...")
+        print("   (with 4 parallel workers)")
+
+    try:
+        translated_data, selected_keys = translator_instance.translate_json_selective(
+            data=data,
+            keys_to_translate=keys_list,
+            target_lang=args.lang,
+            model=args.model,
+            preserve_tags=args.all
+        )
+
+        if not args.quiet:
+            print(f"✅ Translated {len(selected_keys)} keys successfully")
+            print(f"   Cache stats - Hits: {translator_instance.cache.stats['hits']}, Misses: {translator_instance.cache.stats['misses']}")
+
+        # Show quality validation if requested
+        if args.validate and translator_instance.quality_issues:
+            print("\n⚠️  Quality Issues Detected:")
+            for issue_record in translator_instance.quality_issues:
+                print(f"\n  Source: {issue_record['source']}")
+                print(f"  Target: {issue_record['target']}")
+                for issue in issue_record['issues']:
+                    print(f"    • {issue}")
+
+        # Save output
+        output_path = args.output or 'translated_output.json'
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(translated_data, f, ensure_ascii=False, indent=2)
+
+        if not args.quiet:
+            print(f"\n💾 Saved translated JSON to {output_path}")
+
+        if translator_instance.quality_issues and not args.validate:
+            print(f"⚠️  Found {len(translator_instance.quality_issues)} quality issues. Use --validate to see details.")
+
+    except KeyboardInterrupt:
+        print("\n⏹️  Translation interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n❌ Translation failed: {e}")
+        logger.exception("CLI translation failed")
+        sys.exit(1)
+
+
 def main():
-    """Main entry point"""
+    """Main entry point for GUI"""
     logger.info("Starting JSON Selective Translator with Ollama")
 
     # Check if Ollama is available
@@ -1067,4 +1321,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    # Check if CLI arguments are provided
+    if len(sys.argv) > 1:
+        # CLI mode (if any arguments besides script name)
+        cli_main()
+    else:
+        # GUI mode (no arguments)
+        main()
