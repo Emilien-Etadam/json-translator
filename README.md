@@ -2,6 +2,8 @@
 
 Un outil Python avec interface Gradio pour traduire sélectivement des clés JSON spécifiques en utilisant des modèles Ollama locaux.
 
+**Français** | **[English](README_EN.md)**
+
 ## ✨ Fonctionnalités
 
 ### Principales
@@ -307,7 +309,7 @@ Les contributions sont les bienvenues ! N'hésitez pas à :
 
 ## 📄 Licence
 
-Ce projet est libre d'utilisation pour des projets personnels et commerciaux.
+Ce projet est sous licence MIT - voir le fichier [LICENSE](LICENSE) pour plus de détails.
 
 ## 🙏 Remerciements
 
