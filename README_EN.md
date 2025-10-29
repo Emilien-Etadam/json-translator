@@ -24,6 +24,15 @@ A Python tool with Gradio interface for selectively translating specific JSON ke
 
 ## 🚀 Installation
 
+### Deployment
+
+**Option 1: Deploy on Coolify** (recommended for servers)
+- See complete guide: [DEPLOY_COOLIFY.md](DEPLOY_COOLIFY.md)
+- Native Nixpacks support
+- Simple configuration via environment variables
+
+**Option 2: Local installation**
+
 ### Prerequisites
 1. **Python 3.8+**
 2. **Ollama** installed and running

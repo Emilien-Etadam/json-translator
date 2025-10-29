@@ -8,6 +8,7 @@ import json
 import re
 import logging
 import threading
+import os
 from pathlib import Path
 from typing import Dict, List, Any, Set, Optional, Tuple
 from datetime import datetime
@@ -16,9 +17,15 @@ from collections import defaultdict
 import gradio as gr
 import ollama
 
+# Configure Ollama client with custom host if provided
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+ollama_client = ollama.Client(host=OLLAMA_HOST)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+logger.info(f"Ollama client configured to connect to: {OLLAMA_HOST}")
 
 
 class TranslationCache:
@@ -448,7 +455,7 @@ class OllamaTranslator:
     def get_available_models() -> List[str]:
         """Get list of installed Ollama models"""
         try:
-            models = ollama.list().get('models', [])
+            models = ollama_client.list().get('models', [])
             names = []
             for model in models:
                 if 'name' in model:
@@ -511,7 +518,7 @@ class OllamaTranslator:
             from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
             def _call_ollama():
-                return ollama.chat(
+                return ollama_client.chat(
                     model=model,
                     messages=[{'role': 'user', 'content': prompt}]
                 )
@@ -1312,11 +1319,19 @@ def main():
 
     # Create and launch interface
     app = create_gradio_interface()
-    app.launch(
-        server_name="127.0.0.1",
 
+    # Configuration for deployment
+    host = os.getenv("HOST", "0.0.0.0")  # Listen on all interfaces for Coolify
+    port = int(os.getenv("PORT", "7860"))  # Configurable port
+    is_production = os.getenv("ENVIRONMENT", "development") == "production"
+
+    logger.info(f"Launching Gradio interface on {host}:{port}")
+
+    app.launch(
+        server_name=host,
+        server_port=port,
         share=False,
-        inbrowser=True
+        inbrowser=not is_production  # Don't open browser in production
     )
 
 
