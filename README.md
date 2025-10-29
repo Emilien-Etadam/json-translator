@@ -24,6 +24,15 @@ Un outil Python avec interface Gradio pour traduire sélectivement des clés JSO
 
 ## 🚀 Installation
 
+### Déploiement
+
+**Option 1 : Déploiement sur Coolify** (recommandé pour serveur)
+- Voir le guide complet : [DEPLOY_COOLIFY.md](DEPLOY_COOLIFY.md)
+- Support Nixpacks natif
+- Configuration simple via variables d'environnement
+
+**Option 2 : Installation locale**
+
 ### Prérequis
 1. **Python 3.8+**
 2. **Ollama** installé et en cours d'exécution
